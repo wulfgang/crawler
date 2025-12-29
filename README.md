@@ -27,7 +27,7 @@ Then, set up the project:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/crawler.git
+git clone https://github.com/wulfgang/crawler.git
 cd crawler
 
 # Install the package in development mode
@@ -104,20 +104,19 @@ make clean
 crawler/
 ├── src/
 │   └── crawler/
-│       ├── __init__.py
+│       ├── __init__.py      # Package initialization and exports
 │       ├── cli.py          # Command-line interface
-│       ├── config.py       # Configuration management
-│       ├── extractor.py    # Content extraction
-│       ├── http_client.py  # Async HTTP client
-│       └── storage.py      # Output storage handlers
-├── tests/                  # Test files
+│       ├── config.py       # Configuration management with Pydantic
+│       ├── crawler.py      # Core crawling functionality
+│       ├── extractor.py    # Content extraction utilities
+│       ├── http_client.py  # Async HTTP client with rate limiting
+│       └── version.py      # Package version information
 ├── .gitignore
 ├── .pre-commit-config.yaml
 ├── constraints.txt
 ├── Makefile
-├── pyproject.toml
-├── README.md
-└── requirements-dev.in
+├── pyproject.toml          # Project metadata and dependencies
+└── README.md
 ```
 
 ## 🤝 Contributing
