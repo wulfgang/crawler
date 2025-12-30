@@ -2,9 +2,9 @@
 
 import os
 from pathlib import Path
-from typing import List, Optional, Pattern
+from typing import List, Optional, Pattern, Dict, Any
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from pydantic import BaseModel, Field, HttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -94,6 +94,101 @@ class OutputSettings(BaseModel):
             raise ValueError(f"Invalid output directory '{v}': {str(e)}")
 
 
+class ElasticsearchSettings(BaseModel):
+    """Elasticsearch configuration settings."""
+
+    hosts: List[str] = Field(
+        default_factory=lambda: ["http://localhost:9200"],
+        description="List of Elasticsearch nodes to connect to"
+    )
+    index_prefix: str = Field(
+        default="crawler_",
+        description="Prefix to use for all indices created by the crawler"
+    )
+    username: Optional[str] = Field(
+        default=None,
+        description="Username for HTTP basic auth"
+    )
+    password: Optional[SecretStr] = Field(
+        default=None,
+        description="Password for HTTP basic auth"
+    )
+    use_ssl: bool = Field(
+        default=False,
+        description="Whether to use SSL/TLS for the connection"
+    )
+    verify_certs: bool = Field(
+        default=False,
+        description="Whether to verify SSL certificates"
+    )
+    ca_certs: Optional[Path] = Field(
+        default=None,
+        description="Path to CA certificate bundle"
+    )
+    bulk_size: int = Field(
+        default=1000,
+        ge=1,
+        le=10000,
+        description="Number of documents to index in a single bulk request"
+    )
+    timeout: int = Field(
+        default=30,
+        ge=1,
+        description="Timeout in seconds for Elasticsearch operations"
+    )
+    max_retries: int = Field(
+        default=3,
+        ge=0,
+        description="Maximum number of retries for failed requests"
+    )
+    media_storage: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": True,
+            "base_path": "./media",
+            "max_size_mb": 10,
+            "allowed_types": ["image/jpeg", "image/png", "image/gif", "video/mp4"]
+        },
+        description="Configuration for media file storage"
+    )
+
+    @field_validator('hosts')
+    def validate_hosts(cls, v):
+        """Ensure at least one host is provided."""
+        if not v:
+            raise ValueError("At least one Elasticsearch host must be provided")
+        return v
+
+    @field_validator('ca_certs', mode='before')
+    def validate_ca_certs(cls, v):
+        """Ensure CA certificate file exists if provided."""
+        if v is not None:
+            cert_path = Path(v)
+            if not cert_path.exists():
+                raise ValueError(f"CA certificate file not found: {v}")
+            return cert_path
+        return v
+
+    def get_es_connection_params(self) -> Dict[str, Any]:
+        """Get connection parameters for AsyncElasticsearch."""
+        params = {
+            "hosts": self.hosts,
+            "use_ssl": self.use_ssl,
+            "verify_certs": self.verify_certs,
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+        }
+
+        # Add authentication if provided
+        if self.username and self.password:
+            params["basic_auth"] = (self.username, self.password.get_secret_value())
+
+        # Add CA certificate if provided
+        if self.ca_certs:
+            params["ca_certs"] = str(self.ca_certs)
+
+        return params
+
+
 class Settings(BaseSettings):
     """Main settings class for the web crawler."""
 
@@ -116,6 +211,10 @@ class Settings(BaseSettings):
     output: OutputSettings = Field(
         default_factory=OutputSettings,
         description="Output configuration",
+    )
+    elasticsearch: ElasticsearchSettings = Field(
+        default_factory=ElasticsearchSettings,
+        description="Elasticsearch configuration",
     )
 
     @field_validator('start_urls')

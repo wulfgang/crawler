@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "crawler"
 description = "A high-performance web crawler for data extraction"
-version = "0.1.0"
+version = "0.2.1"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
@@ -32,6 +32,9 @@ dependencies = [
     "loguru>=0.7.0",
     "tqdm>=4.66.0",
     "python-dotenv>=1.0.0",
+    "elasticsearch[async]>=8.10.0",
+    "python-multipart>=0.0.6",  # For handling file uploads if needed
+    "aiofiles>=23.2.0",  # For async file operations
 ]
 
 [project.optional-dependencies]
@@ -48,6 +51,8 @@ dev = [
     "pre-commit>=3.0.0",
     "mkdocs>=1.4.0",
     "aioresponses>=0.7.0",
+    "elasticsearch-dsl>=8.10.0",  # For testing and development
+    "pytest-docker>=2.0.0",  # For running Elasticsearch in tests
 ]
 
 [project.scripts]

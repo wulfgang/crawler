@@ -68,6 +68,20 @@ run:
 build:
 	$(UV) pip install -e .
 
+# Update version in both version.py and pyproject.toml
+# Usage: make version VERSION=x.y.z	
+version:
+	@echo "Updating version in version.py and pyproject.toml..."
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Error: VERSION variable not set. Usage: make version VERSION=x.y.z"; \
+		exit 1; \
+	fi
+	@# Update version in version.py
+	@sed -i '' 's/^__version__ = .*/__version__ = "$(VERSION)"/' src/crawler/version.py
+	@# Update version in pyproject.toml
+	@sed -i '' 's/^version = .*/version = "$(VERSION)"/' pyproject.toml
+	@echo "Version updated to $(VERSION)"
+
 # Run the crawler in development mode
 dev:
 	$(UV) pip install -e "."
