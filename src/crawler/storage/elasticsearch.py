@@ -269,7 +269,7 @@ class ElasticsearchStorage(StorageBackend):
         # Prepare the document
         document = {
             "url": url,
-            "title": content.get("title", ""),
+            "title": metadata.get("title", ""),
             "content": {
                 "text": content.get("text", ""),
                 "html": content.get("html", ""),
@@ -390,7 +390,93 @@ class ElasticsearchStorage(StorageBackend):
             logger.error(f"Search failed: {e}")
             raise
 
-    async def save_document(self, index: str, document: Dict[str, Any]) -> str:
+    async def save_document(self, index: str, document: Union[Dict[str, Any], Any]) -> str:
+        """Save a document to the specified index and return its ID.
+        
+        Args:
+            index: The index name (without prefix) to save the document to
+            document: The document to save, can be a dictionary or an ExtractedContent object
+            
+        Returns:
+            str: The ID of the saved document
+            
+        Raises:
+            Exception: If there's an error saving the document
+        """
+        if not self.client:
+            await self.connect()
+        
+        try:
+            # Handle ExtractedContent object
+            if hasattr(document, 'url'):
+                # Extract URL or use the index as fallback
+                url = document.url or f"http://{index}"
+                
+                # Prepare content structure
+                content = {
+                    'text': getattr(document, 'text', ''),
+                    'language': getattr(document, 'language', 'en')
+                }
+                
+                # Process links if they exist
+                links = []
+                if hasattr(document, 'links') and document.links:
+                    base_domain = urlparse(url).netloc
+                    links = [
+                        {
+                            'url': link[0] if isinstance(link, (list, tuple)) and len(link) > 0 else str(link),
+                            'text': link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else '',
+                            'is_internal': str(link[0]).startswith(('http', '//')) and 
+                                        urlparse(str(link[0])).netloc == base_domain
+                        }
+                        for link in document.links
+                    ]
+                    content['links'] = links
+                
+                # Prepare metadata
+                metadata = {
+                    'title': getattr(document, 'title', ''),
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                
+                # Add additional metadata if available
+                if hasattr(document, 'metadata') and document.metadata:
+                    metadata.update({
+                        k: v for k, v in document.metadata.items()
+                        if k not in {'url', 'content', 'title', 'links', 'images', 'language'}
+                    })
+                
+                # Prepare media (images) if they exist
+                media = None
+                if hasattr(document, 'images') and document.images:
+                    media = [
+                        {
+                            'url': img.get('url', ''),
+                            'alt': img.get('alt', ''),
+                            'title': img.get('title', '')
+                        }
+                        for img in document.images
+                        if isinstance(img, dict) and 'url' in img
+                    ]
+                
+                # Use index_document to handle the actual indexing
+                doc_id = await self.index_document(
+                    url=url,
+                    content=content,
+                    metadata=metadata,
+                    media=media
+                )
+                
+                logger.debug(f"Document {doc_id} indexed in {self.index_prefix}{index}")
+                return doc_id
+            
+        except Exception as e:
+            logger.error(f"Error saving document to {index}: {e}")
+            if hasattr(e, '__traceback__'):
+                logger.error(f"Traceback: {e.__traceback__}")
+            raise
+
+    async def save_document1(self, index: str, document: Dict[str, Any]) -> str:
         """Save a document to the specified index and return its ID.
         
         Args:
@@ -410,30 +496,76 @@ class ElasticsearchStorage(StorageBackend):
             # Add prefix to index name
             full_index_name = f"{self.index_prefix}{index}"
             
-            # Generate a document ID using URL if available, or let ES generate one
+            
             doc_id = None
-            if 'url' in document:
-                # Use URL hash as document ID for deduplication
-                doc_id = self._generate_document_id(document['url'])
+            
             
             # Add timestamp if not present
             if 'timestamp' not in document:
                 from datetime import datetime
                 document['timestamp'] = datetime.utcnow().isoformat()
             
+            # Prepare content structure for index_document
+            content = {
+                'text': document.get('content', ''),
+                'language': document.get('language', 'en'),
+                'links': []
+            }
+
+            # Process links if they exist
+            if 'links' in document and document['links']:
+                content['links'] = [
+                    {
+                        'url': link[0] if isinstance(link, (list, tuple)) and len(link) > 0 else str(link),
+                        'text': link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else '',
+                        'is_internal': str(link[0]).startswith(('http', '//')) and 
+                                    urlparse(str(link[0])).netloc == urlparse(url).netloc
+                    }
+                    for link in document['links']
+                ]
+
+            # Prepare metadata, excluding fields already handled by index_document
+            metadata = {
+                'title': document.get('title', ''),
+                **{k: v for k, v in document.get('metadata', {}).items() 
+                if k not in {'url', 'content', 'title', 'links', 'images', 'language'}}
+            }
+            
+            # Prepare media (images)
+            media = None
+            if 'images' in document and document['images']:
+                media = [
+                    {
+                        'url': img.get('url', ''),
+                        'alt': img.get('alt', ''),
+                        'title': img.get('title', ''),
+                        'local_path': img.get('local_path', ''),
+                        'file_size': img.get('file_size', 0),
+                        'dimensions': {
+                            'width': img.get('width', 0),
+                            'height': img.get('height', 0)
+                        } if any(k in img for k in ['width', 'height']) else None
+                    }
+                    for img in document['images']
+                    if isinstance(img, dict)
+                ]
+
+
             # Save the document
-            response = await self.client.index(
-                index=full_index_name,
-                id=doc_id,
-                document=document,
-                refresh=True  # Make the document immediately searchable
+            doc_id = await self.index_document(
+                url=document.get('url', f"http://{index}"),
+                content=content,
+                metadata=metadata if metadata else None,
+                media=media
             )
             
-            logger.debug(f"Document indexed: {response['_id']} in index {full_index_name}")
-            return response['_id']
+            logger.info(f"Document indexed: {doc_id} in index {full_index_name}")
+            return doc_id
             
         except Exception as e:
-            logger.error(f"Error indexing document: {e}")
+            logger.error(f"Error saving document to {index}: {e}")
+            if hasattr(e, '__traceback__'):
+                logger.error(f"Traceback: {e.__traceback__}")
             raise
 
     async def get_document(self, doc_id: str, index_name: str = None) -> Optional[Dict[str, Any]]:

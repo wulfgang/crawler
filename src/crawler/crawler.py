@@ -116,17 +116,18 @@ class Crawler:
                     with open(self.output_file, "w", encoding="utf-8") as f:
                         json.dump(existing_data, f, ensure_ascii=False, indent=2)
 
-            logger.debug(f"Saved content from {url} to {self.output_file}")
+            logger.info(f"Saved content from {url} to {self.output_file}")
 
             # Save to Elasticsearch if specified
             if hasattr(self.settings, 'elasticsearch') and self.settings.elasticsearch:
+                logger.info(f"Saving content to Elasticsearch for URL: {url}")
                 try:
                     # Save to Elasticsearch using the storage instance
                     doc_id = await self.elasticsearch.save_document(
                         index=self._get_index_name(url),  # This will be processed by _get_index_name
-                        document=data
+                        document=content#data
                     )
-                    logger.debug(f"Indexed document {doc_id} for URL: {url}")
+                    logger.info(f"Indexed document {doc_id} for URL: {url}")
                 except Exception as e:
                     logger.error(f"Failed to index document for {url}: {e}")
                     if hasattr(e, '__traceback__'):
