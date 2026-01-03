@@ -32,6 +32,27 @@ class CrawlSettings(BaseModel):
         gt=0,
         description="Request timeout in seconds",
     )
+    max_concurrent_requests: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent requests",
+    )
+    max_links_per_page: int = Field(
+        default=50,
+        ge=1,
+        description="Maximum number of links to follow per page",
+    )
+    dedupe_mode: str = Field(
+        default="skip",
+        pattern=r"^(skip|force|if-modified)$",
+        description="Deduplication mode: 'skip' to skip existing, 'force' to recrawl, 'if-modified' to check for changes",
+    )
+    cache_ttl: int = Field(
+        default=3600,
+        ge=0,
+        description="Time-to-live for document cache in seconds",
+    )
     user_agent: str = Field(
         default=(
             "Mozilla/5.0 (compatible; WebCrawler/1.0; "

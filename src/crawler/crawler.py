@@ -37,7 +37,8 @@ class Crawler:
         if hasattr(settings, 'elasticsearch') and settings.elasticsearch:
             self.elasticsearch = ElasticsearchStorage(
                 **settings.elasticsearch.get_es_connection_params(),
-                index_prefix=settings.elasticsearch.index_prefix
+                index_prefix=settings.elasticsearch.index_prefix,
+                dedupe_mode=getattr(settings.crawl, 'dedupe_mode', 'skip')
             )
             logger.info(f"Initialized Elasticsearch storage with prefix: {settings.elasticsearch.index_prefix}")
             logger.info(f"Elasticsearch connection parameters: {settings.elasticsearch.get_es_connection_params()}")
@@ -149,44 +150,117 @@ class Crawler:
         return str(url) if hasattr(url, '__str__') else url
 
     async def _process_url(self, url: Union[str, HttpUrl], depth: int = 0):
-        """Process a single URL."""
-        if depth > self.settings.crawl.depth:
-            return
+        """Process a single URL.
 
+        Args:
+            url: The URL to process
+            depth: Current crawl depth
+        """
         url_str = self._get_url_string(url)
-        if url_str in self.visited_urls:
+        
+        # Skip if we've already visited this URL or max depth exceeded
+        if (url_str in self.visited_urls or 
+            (self.settings.crawl.depth is not None and depth > self.settings.crawl.depth)):
             return
 
         self.visited_urls.add(url_str)
-        logger.info(f"Crawling: {url_str} (depth: {depth})")
+        logger.info(f"Processing URL: {url_str} (depth: {depth})")
 
         try:
+            # Only check for duplicates if we're at max depth (leaf node)
+            is_leaf_node = (self.settings.crawl.depth is not None and 
+                          depth >= self.settings.crawl.depth)
+            
+            if (hasattr(self.settings, 'elasticsearch') and 
+                self.elasticsearch and
+                hasattr(self.settings.crawl, 'dedupe_mode') and
+                is_leaf_node):  # Only check for duplicates on leaf nodes
+                
+                # Get dedupe mode from settings
+                dedupe_mode = self.settings.crawl.dedupe_mode
+                
+                # Check if we should skip this URL
+                if not await self.elasticsearch.should_recrawl(url_str, mode=dedupe_mode):
+                    logger.info(f"Skipping duplicate leaf URL: {url_str}")
+                    return
+
+            # Make the HTTP request
             response = await self.client.get(url_str)
             response.raise_for_status()
+
+            # Extract content - pass only the HTML content, URL is not needed as it's already set in the ExtractedContent
+            content = self.extractor.extract(html_content=response.text, url=url_str)
             
-            # Extract content
-            extracted = self.extractor.extract(str(response.url), response.text)
-            if extracted:
-                # Save the extracted content
-                await self._save_content(url_str, extracted)
-                logger.info(f"Extracted content from {url_str}: {extracted.title}")
-            
-            # Process links for further crawling if we haven't reached max depth
-            if depth < self.settings.crawl.depth:
-                # Extract links from the page
-                links = [link[0] for link in extracted.links] if extracted and hasattr(extracted, 'links') else []
+            # Save the extracted content
+            await self._save_content(url_str, content)
+
+            # Process links if we haven't reached max depth
+            if self.settings.crawl.depth is None or depth < self.settings.crawl.depth:
+                # Get links from the extracted content
+                links = getattr(content, 'links', [])
                 
-                # Process child URLs with increased depth
-                tasks = [self._process_url(link, depth + 1) for link in links]
-                if tasks:
-                    await asyncio.gather(*tasks)
-            
+                # Process links in parallel with a limit on concurrency
+                tasks = []
+                for link in links[:getattr(self.settings.crawl, 'max_links_per_page', 50)]:
+                    link_url = link[0] if isinstance(link, (list, tuple)) else link
+                    if isinstance(link_url, str) and link_url not in self.visited_urls:
+                        tasks.append(
+                            self._process_url(link_url, depth + 1)
+                        )
+                
+                # Process links with concurrency control
+                max_concurrent = getattr(self.settings.crawl, 'max_concurrent_requests', 10)
+                for i in range(0, len(tasks), max_concurrent):
+                    batch = tasks[i:i + max_concurrent]
+                    await asyncio.gather(*batch, return_exceptions=True)
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error for {url_str}: {e.response.status_code} {e.response.reason_phrase}")
+            # Save error information if Elasticsearch is enabled
+            if hasattr(self, 'elasticsearch') and self.elasticsearch:
+                try:
+                    error_doc = {
+                        "url": url_str,
+                        "error": {
+                            "status_code": e.response.status_code,
+                            "reason": e.response.reason_phrase,
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                    }
+                    await self.elasticsearch.save_document(
+                        index=self._get_index_name(url_str),
+                        document=error_doc
+                    )
+                except Exception as es_error:
+                    logger.error(f"Failed to save error to Elasticsearch: {es_error}")
+                    
         except Exception as e:
             logger.error(f"Error processing {url_str}: {str(e)}")
+            if hasattr(e, '__traceback__'):
+                logger.error(f"Traceback: {e.__traceback__}")
 
     async def close(self):
-        """Close the HTTP client."""
-        await self.client.aclose()
+        """Close all resources including HTTP client and Elasticsearch connection."""
+        try:
+            if hasattr(self, 'client') and self.client:
+                await self.client.aclose()
+                logger.debug("HTTP client closed successfully")
+                
+            if hasattr(self, 'elasticsearch') and self.elasticsearch:
+                if hasattr(self.elasticsearch, 'close') and callable(self.elasticsearch.close):
+                    await self.elasticsearch.close()
+                    logger.debug("Elasticsearch client closed successfully")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            raise
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - ensures resources are cleaned up."""
+        await self.close()
 
     async def crawl(self):
         """Start the crawling process."""
@@ -195,89 +269,33 @@ class Crawler:
         try:
             tasks = [self._process_url(url) for url in self.settings.start_urls]
             await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(f"Error during crawling: {e}")
+            raise
         finally:
-            await self.close()
+            # Don't close the client here, let the context manager handle it
+            pass
 
 async def crawl(settings: Settings):
     """Run the crawler with the given settings."""
-    crawler = Crawler(settings)
-    
-    # Check Elasticsearch connection if configured
-    if crawler.elasticsearch:
-        max_retries = 3
-        retry_delay = 2  # seconds
+    async with Crawler(settings) as crawler:
+        # Check Elasticsearch connection if configured
+        if crawler.elasticsearch:
+            max_retries = 3
+            retry_delay = 2  # seconds
+            
+            for attempt in range(1, max_retries + 1):
+                try:
+                    await crawler.elasticsearch.connect()
+                    logger.info("Successfully connected to Elasticsearch")
+                    break
+                except Exception as e:
+                    if attempt < max_retries:
+                        logger.warning(f"Failed to connect to Elasticsearch (attempt {attempt}/{max_retries}): {e}")
+                        await asyncio.sleep(retry_delay * attempt)
+                    else:
+                        logger.error(f"Failed to connect to Elasticsearch after {max_retries} attempts")
+                        raise
         
-        for attempt in range(1, max_retries + 1):
-            try:
-                await crawler.elasticsearch.connect()
-                logger.info("Successfully connected to Elasticsearch")
-                break
-            except Exception as e:
-                # Get the ElasticsearchStorage instance
-                es = crawler.elasticsearch
-                
-                # Get all relevant configuration parameters
-                config_params = {
-                    'hosts': es.hosts,
-                    'index_prefix': es.index_prefix,
-                    'username': es.username if hasattr(es, 'username') else None,
-                    'use_ssl': es.use_ssl if hasattr(es, 'use_ssl') else None,
-                    'verify_certs': es.verify_certs if hasattr(es, 'verify_certs') else None,
-                    'ca_certs': str(es.ca_certs) if hasattr(es, 'ca_certs') and es.ca_certs else None,
-                    'timeout': f"{es.timeout}s" if hasattr(es, 'timeout') else None,
-                    'max_retries': es.max_retries if hasattr(es, 'max_retries') else None,
-                    'bulk_size': es.bulk_size if hasattr(es, 'bulk_size') else None
-                }
-                
-                # Filter out None values for cleaner output
-                config_params = {k: v for k, v in config_params.items() if v is not None}
-                
-                # Format configuration for display
-                config_display = "\n  ".join(f"{k}: {v}" for k, v in config_params.items())
-                
-                error_details = {
-                    'attempt': f"{attempt}/{max_retries}",
-                    'error_type': e.__class__.__name__,
-                    'error_message': str(e),
-                    'config': config_display
-                }
-                
-                if attempt == max_retries:
-                    error_msg = (
-                        "❌ Failed to connect to Elasticsearch after {attempt} attempts\n\n"
-                        "🔧 Configuration Used:\n"
-                        "  {config}\n\n"
-                        "💥 Error Details:\n"
-                        "  - Type: {error_type}\n"
-                        "  - Message: {error_message}\n\n"
-                        "🔍 Troubleshooting Tips:\n"
-                        "  1. Verify that your Elasticsearch server is running and accessible\n"
-                        "  2. Check if the host and port are correct\n"
-                        "  3. If using authentication, verify the username and password\n"
-                        "  4. For SSL/TLS connections, ensure the certificates are valid\n"
-                        "  5. Check if any firewall is blocking the connection"
-                    ).format(**error_details)
-                    
-                    logger.error(error_msg)
-                    await crawler.close()
-                    sys.exit(1)
-                
-                logger.warning(
-                    "⚠️  Elasticsearch connection attempt {attempt} failed: {error_type} - {error_message}\n"
-                    "   Using config: {config}\n"
-                    "   Retrying in {delay}s... (Attempt {current}/{total})".format(
-                        attempt=attempt,
-                        error_type=error_details['error_type'],
-                        error_message=error_details['error_message'],
-                        config=config_display,
-                        delay=retry_delay,
-                        current=attempt,
-                        total=max_retries
-                    )
-                )
-                await asyncio.sleep(retry_delay)
-    
-    try:
+        # Start the crawl
         await crawler.crawl()
-    finally:
-        await crawler.close()

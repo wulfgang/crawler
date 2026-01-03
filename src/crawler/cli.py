@@ -147,6 +147,34 @@ def cli(ctx: click.Context, log_level: str):
     show_default=True,
     help="Output format for saved content.",
 )
+@click.option(
+    "--max-concurrent-requests",
+    type=click.IntRange(1, 100),
+    default=10,
+    show_default=True,
+    help="Maximum number of concurrent HTTP requests.",
+)
+@click.option(
+    "--max-links-per-page",
+    type=click.IntRange(1, 1000),
+    default=50,
+    show_default=True,
+    help="Maximum number of links to follow per page.",
+)
+@click.option(
+    "--dedupe-mode",
+    type=click.Choice(["skip", "force", "if-modified"], case_sensitive=False),
+    default="skip",
+    show_default=True,
+    help="Deduplication mode: 'skip' to skip existing, 'force' to recrawl, 'if-modified' to check for changes",
+)
+@click.option(
+    "--cache-ttl",
+    type=click.IntRange(0, 86400 * 7),  # 0 to 7 days
+    default=3600,  # 1 hour
+    show_default=True,
+    help="Time-to-live for document cache in seconds (0 = no caching).",
+)
 @common_options
 @click.pass_context
 def crawl(
@@ -157,6 +185,10 @@ def crawl(
     max_depth: int,
     workers: int,
     output_format: str,
+    max_concurrent_requests: int,
+    max_links_per_page: int,
+    dedupe_mode: str,
+    cache_ttl: int,
     **es_kwargs
 ):
     """Crawl a website and save the extracted content.
@@ -171,40 +203,42 @@ def crawl(
         # Prepare settings
         settings = Settings(
             start_urls=[url],
-            output=OutputSettings(
-                output_dir=output_dir,
-                output_format=output_format
-            ),
             crawl=CrawlSettings(
                 max_depth=max_depth,
                 workers=workers,
-                request_delay=1.0,
-                respect_robots_txt=True,
+                max_concurrent_requests=max_concurrent_requests,
+                max_links_per_page=max_links_per_page,
+                dedupe_mode=dedupe_mode,
+                cache_ttl=cache_ttl,
+            ),
+            output=OutputSettings(
+                output_dir=output_dir,
+                output_format=output_format,
             ),
         )
-        
-        # Initialize Elasticsearch settings if enabled
+
+        # Configure Elasticsearch if enabled
         if use_es:
-            from .config import ElasticsearchSettings
-            
-            # Get ES settings from kwargs (already populated from env if not provided via CLI)
-            es_settings = {
-                k[3:]: v for k, v in es_kwargs.items()
-                if k.startswith('es_') and k != 'es_use_es' and v is not None
-            }
-            logger.info(f"Initialize ElasticsearchSettings with parameters: {es_settings}")
-            # Create ElasticsearchSettings instance
-            settings.elasticsearch = ElasticsearchSettings(**es_settings)
-            logger.info(f"Elasticsearch storage enabled. Index prefix: {settings.elasticsearch.index_prefix}")
-        
-        from .crawler import crawl as run_crawl
+            settings.elasticsearch = ElasticsearchSettings(
+                **{
+                    k[3:]: v 
+                    for k, v in es_kwargs.items()
+                    if k.startswith("es_") and v is not None
+                }
+            )
+
+        # Create and run the crawler
+        from .crawler import crawl as run_crawler_async
         import asyncio
-        asyncio.run(run_crawl(settings))
+        
+        # Run the async crawl function
+        asyncio.run(run_crawler_async(settings))
+
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        if logger.level("DEBUG"):
+        logger.error(f"Crawling failed: {e}")
+        if ctx.obj and ctx.obj.get("debug"):
             import traceback
-            logger.debug(traceback.format_exc())
+            traceback.print_exc()
         sys.exit(1)
 
 @cli.group()

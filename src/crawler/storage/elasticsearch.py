@@ -111,6 +111,7 @@ class ElasticsearchStorage(StorageBackend):
         timeout: int = 30,
         max_retries: int = 3,
         bulk_size: int = 1000,
+        dedupe_mode: str = "skip",
         **kwargs
     ):
         """Initialize the Elasticsearch storage backend.
@@ -126,6 +127,7 @@ class ElasticsearchStorage(StorageBackend):
             timeout: Timeout in seconds for Elasticsearch operations.
             max_retries: Maximum number of retries for failed requests.
             bulk_size: Number of documents to index in a single bulk request.
+            dedupe_mode: Deduplication mode ('skip', 'force', or 'if-modified').
             **kwargs: Additional arguments to pass to AsyncElasticsearch.
         """
         self.hosts = [hosts] if isinstance(hosts, str) else hosts
@@ -138,6 +140,7 @@ class ElasticsearchStorage(StorageBackend):
         self.timeout = timeout
         self.max_retries = max_retries
         self.bulk_size = bulk_size
+        self._dedupe_mode = dedupe_mode
         
         # Store additional kwargs for AsyncElasticsearch
         self._es_kwargs = kwargs
@@ -282,6 +285,7 @@ class ElasticsearchStorage(StorageBackend):
                 "crawled_at": datetime.utcnow().isoformat(),
                 "status": "success",
                 "http_status": 200,
+                "error": "",
                 "crawl_depth": metadata.get("crawl_depth", 0) if metadata else 0
             },
             "fingerprint": self._generate_content_fingerprint(content.get("text", ""))
@@ -308,87 +312,115 @@ class ElasticsearchStorage(StorageBackend):
             logger.error(f"Failed to index document {url}: {e}")
             raise
 
+    async def document_exists(self, url: str) -> bool:
+        """Check if a document exists for the given URL.
+
+        Args:
+            url: The URL to check
+
+        Returns:
+            bool: True if document exists, False otherwise
+        """
+        if not self.client:
+            await self.connect()
+            
+        try:
+            doc_id = self._generate_document_id(url)
+            return await self.client.exists(
+                index=f"{self.index_prefix}*",  # Search across all crawler indices
+                id=doc_id
+            )
+        except Exception as e:
+            logger.error(f"Error checking document existence for {url}: {str(e)}")
+            return False
+
+    async def get_document_metadata(self, url: str) -> Optional[Dict]:
+        """Get document metadata including crawl status and timestamps.
+
+        Args:
+            url: The URL to get metadata for
+
+        Returns:
+            Optional[Dict]: Document metadata if found, None otherwise
+        """
+        if not self.client:
+            await self.connect()
+            
+        try:
+            doc_id = self._generate_document_id(url)
+            
+            # First, search for the document to find which index it's in
+            search_body = {
+                "query": {
+                    "term": {
+                        "_id": doc_id
+                    }
+                },
+                "_source": ["crawl_info", "fingerprint"],
+                "size": 1
+            }
+            
+            search_response = await self.client.search(
+                index=f"{self.index_prefix}*",
+                body=search_body
+            )
+            
+            # If we found the document, return its source
+            if search_response["hits"]["total"]["value"] > 0:
+                return search_response["hits"]["hits"][0]["_source"]
+                
+            return None
+            
+        except NotFoundError:
+            return None
+        except Exception as e:
+            logger.error(f"Error getting document metadata for {url}: {str(e)}")
+            return None
+
+    async def should_recrawl(self, url: str, mode: str = "skip") -> bool:
+        """Determine if a URL should be recrawled based on the specified mode.
+
+        Args:
+            url: The URL to check
+            mode: One of 'skip', 'force', or 'if-modified'
+
+        Returns:
+            bool: True if the URL should be recrawled, False otherwise
+        """
+        if mode == "force":
+            return True
+            
+        doc_meta = await self.get_document_metadata(url)
+        if not doc_meta:
+            return True
+            
+        if mode == "skip":
+            return False
+            
+        if mode == "if-modified":
+            # Here we would implement logic to check if the content has changed
+            # For now, we'll just recrawl if the document is older than 1 day
+            last_crawled = doc_meta.get("crawl_info", {}).get("crawled_at")
+            if last_crawled:
+                from datetime import datetime, timedelta
+                last_crawl_time = datetime.fromisoformat(last_crawled)
+                return datetime.utcnow() - last_crawl_time > timedelta(days=1)
+            return True
+            
+        return True
+
     def _generate_content_fingerprint(self, content: str) -> str:
         """Generate a fingerprint for content to detect duplicates.
 
         Args:
-            content: The content to generate a fingerprint for.
+            content: The content to generate a fingerprint for
 
         Returns:
-            A SHA-256 hash of the normalized content.
+            str: A SHA-256 hash of the normalized content
         """
-        # Normalize the content (lowercase, remove extra whitespace, etc.)
-        normalized = " ".join(content.lower().split())
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-    async def search(
-        self,
-        query: str,
-        filters: Optional[Dict[str, Any]] = None,
-        page: int = 1,
-        page_size: int = 10,
-    ) -> Dict[str, Any]:
-        """Search for documents in Elasticsearch.
-
-        Args:
-            query: The search query.
-            filters: Additional filters to apply to the search.
-            page: The page number (1-based).
-            page_size: The number of results per page.
-
-        Returns:
-            A dictionary containing the search results and metadata.
-        """
-        if not self.client:
-            await self.connect()
-
-        # Build the query
-        must_clauses = [{"match": {"_all": query}}] if query else []
-        
-        # Add filters if provided
-        if filters:
-            for field, value in filters.items():
-                must_clauses.append({"term": {field: value}})
-
-        query_body = {
-            "query": {
-                "bool": {
-                    "must": must_clauses or [{"match_all": {}}]
-                }
-            },
-            "from": (page - 1) * page_size,
-            "size": page_size,
-            "sort": [{"crawl_info.crawled_at": {"order": "desc"}}]
-        }
-
-        try:
-            # Search across all indices with the configured prefix
-            response = await self.client.search(
-                index=f"{self.index_prefix}*",
-                body=query_body
-            )
-
-            # Process the response
-            total = response["hits"]["total"]["value"]
-            hits = [
-                {
-                    "id": hit["_id"],
-                    "index": hit["_index"],
-                    "score": hit["_score"],
-                    **hit["_source"]
-                }
-                for hit in response["hits"]["hits"]
-            ]
-
-            return {
-                "total": total,
-                "page": page,
-                "page_size": page_size,
-                "results": hits
-            }
-        except Exception as e:
-            logger.error(f"Search failed: {e}")
-            raise
+        # Normalize content by removing extra whitespace and converting to lowercase
+        normalized = ' '.join(str(content).strip().split()).lower()
+        return f"sha256:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
 
     async def save_document(self, index: str, document: Union[Dict[str, Any], Any]) -> str:
         """Save a document to the specified index and return its ID.
@@ -460,113 +492,25 @@ class ElasticsearchStorage(StorageBackend):
                     ]
                 
                 # Use index_document to handle the actual indexing
-                doc_id = await self.index_document(
-                    url=url,
-                    content=content,
-                    metadata=metadata,
-                    media=media
-                )
-                
-                logger.debug(f"Document {doc_id} indexed in {self.index_prefix}{index}")
-                return doc_id
-            
+                if await self.should_recrawl(url, mode=self._dedupe_mode):
+                    doc_id = await self.index_document(
+                        url=url,
+                        content=content,
+                        metadata=metadata,
+                        media=media
+                    )
+                    
+                    logger.debug(f"Document {doc_id} indexed in {self.index_prefix}{index}")
+                    return doc_id
+                logger.info(f"Document of {url} already exists in {self.index_prefix}{index}")
+                return self._generate_document_id(url)
+
         except Exception as e:
             logger.error(f"Error saving document to {index}: {e}")
             if hasattr(e, '__traceback__'):
                 logger.error(f"Traceback: {e.__traceback__}")
             raise
 
-    async def save_document1(self, index: str, document: Dict[str, Any]) -> str:
-        """Save a document to the specified index and return its ID.
-        
-        Args:
-            index: The index name (without prefix) to save the document to
-            document: The document to save
-            
-        Returns:
-            str: The ID of the saved document
-            
-        Raises:
-            Exception: If there's an error saving the document
-        """
-        if not self.client:
-            await self.connect()
-        
-        try:
-            # Add prefix to index name
-            full_index_name = f"{self.index_prefix}{index}"
-            
-            
-            doc_id = None
-            
-            
-            # Add timestamp if not present
-            if 'timestamp' not in document:
-                from datetime import datetime
-                document['timestamp'] = datetime.utcnow().isoformat()
-            
-            # Prepare content structure for index_document
-            content = {
-                'text': document.get('content', ''),
-                'language': document.get('language', 'en'),
-                'links': []
-            }
-
-            # Process links if they exist
-            if 'links' in document and document['links']:
-                content['links'] = [
-                    {
-                        'url': link[0] if isinstance(link, (list, tuple)) and len(link) > 0 else str(link),
-                        'text': link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else '',
-                        'is_internal': str(link[0]).startswith(('http', '//')) and 
-                                    urlparse(str(link[0])).netloc == urlparse(url).netloc
-                    }
-                    for link in document['links']
-                ]
-
-            # Prepare metadata, excluding fields already handled by index_document
-            metadata = {
-                'title': document.get('title', ''),
-                **{k: v for k, v in document.get('metadata', {}).items() 
-                if k not in {'url', 'content', 'title', 'links', 'images', 'language'}}
-            }
-            
-            # Prepare media (images)
-            media = None
-            if 'images' in document and document['images']:
-                media = [
-                    {
-                        'url': img.get('url', ''),
-                        'alt': img.get('alt', ''),
-                        'title': img.get('title', ''),
-                        'local_path': img.get('local_path', ''),
-                        'file_size': img.get('file_size', 0),
-                        'dimensions': {
-                            'width': img.get('width', 0),
-                            'height': img.get('height', 0)
-                        } if any(k in img for k in ['width', 'height']) else None
-                    }
-                    for img in document['images']
-                    if isinstance(img, dict)
-                ]
-
-
-            # Save the document
-            doc_id = await self.index_document(
-                url=document.get('url', f"http://{index}"),
-                content=content,
-                metadata=metadata if metadata else None,
-                media=media
-            )
-            
-            logger.info(f"Document indexed: {doc_id} in index {full_index_name}")
-            return doc_id
-            
-        except Exception as e:
-            logger.error(f"Error saving document to {index}: {e}")
-            if hasattr(e, '__traceback__'):
-                logger.error(f"Traceback: {e.__traceback__}")
-            raise
 
     async def get_document(self, doc_id: str, index_name: str = None) -> Optional[Dict[str, Any]]:
         """Retrieve a document by its ID.
@@ -733,3 +677,135 @@ class ElasticsearchStorage(StorageBackend):
                 "status": "red",
                 "error": str(e)
             }
+
+    async def search(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> Dict[str, Any]:
+        """Search for documents in Elasticsearch.
+
+        Args:
+            query: The search query.
+            filters: Additional filters to apply to the search.
+            page: The page number (1-based).
+            page_size: The number of results per page.
+
+        Returns:
+            A dictionary containing the search results and metadata.
+        """
+        if not self.client:
+            await self.connect()
+
+        try:
+            # Build the query
+            must_clauses = []
+            
+            # Add full-text search if query is provided
+            if query:
+                must_clauses.append({
+                    "multi_match": {
+                        "query": query,
+                        "fields": ["title^2", "content.text", "content.summary"],
+                        "fuzziness": "AUTO"
+                    }
+                })
+            
+            # Add filters if provided
+            if filters:
+                for field, value in filters.items():
+                    if value is not None:
+                        must_clauses.append({"term": {field: value}})
+            
+            # Build the full query
+            query_body = {
+                "query": {
+                    "bool": {
+                        "must": must_clauses or [{"match_all": {}}]
+                    }
+                },
+                "from": (page - 1) * page_size,
+                "size": page_size,
+                "sort": [
+                    {"_score": {"order": "desc"}},
+                    {"crawl_info.crawled_at": {"order": "desc"}}
+                ],
+                "highlight": {
+                    "fields": {
+                        "content.text": {},
+                        "title": {}
+                    }
+                }
+            }
+
+            # Execute the search
+            response = await self.client.search(
+                index=f"{self.index_prefix}*",
+                body=query_body
+            )
+
+            # Process the results
+            hits = []
+            for hit in response.get('hits', {}).get('hits', []):
+                source = hit.get('_source', {})
+                highlight = hit.get('highlight', {})
+                
+                hits.append({
+                    'id': hit['_id'],
+                    'index': hit['_index'],
+                    'score': hit.get('_score'),
+                    'url': source.get('url'),
+                    'title': source.get('title'),
+                    'summary': source.get('content', {}).get('summary'),
+                    'crawled_at': source.get('crawl_info', {}).get('crawled_at'),
+                    'highlight': highlight
+                })
+
+            return {
+                'total': response['hits']['total']['value'],
+                'page': page,
+                'page_size': page_size,
+                'results': hits
+            }
+
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            if hasattr(e, '__traceback__'):
+                logger.error(f"Traceback: {e.__traceback__}")
+            return {
+                'total': 0,
+                'page': page,
+                'page_size': page_size,
+                'results': []
+            }
+
+    async def close(self) -> None:
+        """Close the Elasticsearch client connection and clean up resources."""
+        if hasattr(self, 'client') and self.client is not None:
+            try:
+                # Close the Elasticsearch client which will close its aiohttp session
+                await self.client.close()
+                logger.debug("Elasticsearch client closed successfully")
+                
+                # Explicitly close any aiohttp client session if it exists
+                if hasattr(self.client, 'transport') and hasattr(self.client.transport, '_async_clients'):
+                    for client in self.client.transport._async_clients:
+                        if hasattr(client, 'close'):
+                            await client.close()
+                            logger.debug("aiohttp client session closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing Elasticsearch client: {e}")
+            finally:
+                self.client = None
+
+    # Make the class work as an async context manager
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - ensures resources are cleaned up."""
+        await self.close()
